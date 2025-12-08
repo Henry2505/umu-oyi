@@ -1,4 +1,3 @@
-// index.js
 'use strict';
 
 const express = require('express');
@@ -10,6 +9,9 @@ const helmet = require('helmet');
 const REDIS_URL = process.env.REDIS_URL || '';
 const WEBSOCKET_SECRET = process.env.WEBSOCKET_SECRET || ''; // set a secret token for /emit auth
 const PORT = process.env.PORT || 3000;
+const REALTIME_WS_PATH = process.env.REALTIME_WS_PATH || '/realtime-ws';
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const APP_URL = (process.env.APP_URL || '').replace(/\/$/, '') || '';
 
 let redis = null;
 let redisPub = null;
@@ -54,7 +56,7 @@ function broadcastToUser(userId, payload) {
 }
 
 // HTTP health check
-app.get('/health', (req,res) => res.json({ ok: true, pid: process.pid }));
+app.get('/health', (req,res) => res.json({ ok: true, pid: process.pid, ws_path: REALTIME_WS_PATH }));
 
 // /emit - called by your backend AFTER saving message to DB
 // requires WEBSOCKET_SECRET to be set and provided by header 'x-realtime-secret' or query param ?secret=
@@ -105,10 +107,26 @@ app.post('/emit', async (req, res) => {
 
 // create server + ws
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/realtime-ws' });
+const wss = new WebSocket.Server({ server, path: REALTIME_WS_PATH });
+
+// function to safely close ws with code & reason
+function closeWsWithReason(ws, code = 1008, reason = 'Policy') {
+  try { ws.send(JSON.stringify({ type: 'error', reason })); } catch (e) {}
+  try { ws.close(code, reason); } catch (e) {}
+}
 
 wss.on('connection', (ws, req) => {
   ws._meta = { authenticated: false, userId: null, createdAt: Date.now() };
+
+  // simple origin check (best-effort; origin header can be absent for native clients)
+  try {
+    const origin = (req.headers && req.headers.origin) ? req.headers.origin : null;
+    if (ALLOWED_ORIGINS.length && origin && !ALLOWED_ORIGINS.includes(origin)) {
+      console.warn('Connection from disallowed origin', origin);
+      closeWsWithReason(ws, 4003, 'origin_not_allowed');
+      return;
+    }
+  } catch (e) {}
 
   // a small ping/pong keepalive
   ws.isAlive = true;
@@ -126,7 +144,7 @@ wss.on('connection', (ws, req) => {
       if (!token) {
         sendWs(ws, { type: 'auth_failed', reason: 'no token' }); ws.close(4001, 'no token'); return;
       }
-      // If you want JWT verification, decode/verify here. For simple, treat token as userId.
+      // NOTE: For production you should verify JWTs properly. Here we accept token as userId.
       const userId = token; // Replace with verification if desired
       ws._meta.authenticated = true;
       ws._meta.userId = String(userId);
@@ -139,7 +157,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // simple client pong/ping or other messages: you can add typing, presence, etc.
+    // simple client ping/pong or other messages: you can add typing, presence, etc.
     if (obj.type === 'ping') { sendWs(ws, { type: 'pong' }); return; }
     if (obj.type === 'typing') {
       // { type: 'typing', to: '<userId>', typing: true|false }
@@ -154,7 +172,7 @@ wss.on('connection', (ws, req) => {
 
     // allow clients to emit messages directly (not recommended unless you do DB persist)
     if (obj.type === 'client_emit' && obj.payload) {
-      // echo to target
+      // echo to target (will not persist)
       if (obj.to) {
         const out = { type: 'message_created', message: obj.payload, to: obj.to, from: ws._meta.userId, ts: Date.now() };
         if (USE_REDIS && redisPub) redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(()=>{});
@@ -218,6 +236,7 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Realtime WS server listening on port ${PORT} path /realtime-ws`);
+  console.log(`Realtime WS server listening on port ${PORT} path ${REALTIME_WS_PATH}`);
+  if (APP_URL) console.log('App URL:', APP_URL);
   if (!WEBSOCKET_SECRET) console.warn('Warning: WEBSOCKET_SECRET not set. /emit is unprotected; set WEBSOCKET_SECRET env var.');
 });
