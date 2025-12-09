@@ -23,10 +23,7 @@ if (USE_REDIS) {
     redisPub = new IORedis(REDIS_URL);
     redisSub = new IORedis(REDIS_URL);
     redis = new IORedis(REDIS_URL);
-    // subscribe in background; errors are non-fatal
-    redisSub.subscribe('umuy:realtime').catch(err => {
-      console.warn('redisSub.subscribe failed (non-fatal):', String(err));
-    });
+    redisSub.subscribe('umuy:realtime').catch(() => {});
     console.info('Redis enabled for realtime presence/pubsub');
   } catch (err) {
     console.warn('Failed to init Redis, continuing without it:', String(err));
@@ -47,7 +44,7 @@ function safeJsonParse(s) {
 }
 
 function sendWs(ws, obj) {
-  try { ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
+  try { ws.send(JSON.stringify(obj)); } catch (e) {}
 }
 
 function broadcastToUser(userId, payload) {
@@ -77,29 +74,22 @@ function broadcastToAll(payload) {
   } catch (e) {}
 }
 
-// update presence immediately in-memory, then persist/publish asynchronously (no await)
+// in-memory first, then fire-and-forget redis write/publish
 async function setPresence(userId, online, extra) {
   try {
     const key = `presence:${userId}`;
     const now = Date.now();
     const payload = { id: String(userId), online: !!online, last_seen: online ? null : now, updated_at: now };
     if (extra && typeof extra === 'object') payload.meta = extra;
-    // immediate in-memory update
     lastSeenMap.set(String(userId), payload);
-    // publish/write to redis asynchronously (fire-and-forget)
+
     if (USE_REDIS && redis) {
-      try {
-        redis.set(key, JSON.stringify(payload), 'EX', 60 * 60 * 24).catch(() => {});
-        if (redisPub) redisPub.publish('umuy:realtime', JSON.stringify({ type: 'presence', user: payload, ts: now })).catch(() => {});
-      } catch (e) {
-        // ignore redis errors; presence already updated in-memory
-      }
+      try { redis.set(key, JSON.stringify(payload), 'EX', 60 * 60 * 24).catch(() => {}); } catch (e) {}
+      try { if (redisPub) redisPub.publish('umuy:realtime', JSON.stringify({ type: 'presence', user: payload, ts: now })).catch(() => {}); } catch (e) {}
     } else {
-      // broadcast to everyone in-memory
       try { broadcastToAll({ type: 'presence', user: payload, ts: now }); } catch (e) {}
     }
-    // debug
-    console.info(`presence set (in-memory) for ${userId} online=${!!online}`);
+    console.info(`presence (in-memory) ${userId} online=${!!online}`);
     return payload;
   } catch (e) {
     console.warn('setPresence error', String(e));
@@ -107,7 +97,6 @@ async function setPresence(userId, online, extra) {
   }
 }
 
-// quick presence read: prefer in-memory, otherwise try redis but with small timeout
 async function getPresence(userId) {
   try {
     const key = `presence:${userId}`;
@@ -116,16 +105,12 @@ async function getPresence(userId) {
     if (USE_REDIS && redis) {
       try {
         const p = redis.get(key);
-        const res = await Promise.race([p, new Promise(r => setTimeout(() => r(null), 500))]); // 500ms cap
+        const res = await Promise.race([p, new Promise(r => setTimeout(() => r(null), 500))]);
         if (res) return safeJsonParse(res);
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     }
     return lastSeenMap.get(String(userId)) || null;
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 app.get('/health', (req, res) => {
@@ -160,13 +145,44 @@ function closeWsWithReason(ws, code = 1008, reason = 'Policy') {
   try { ws.close(code, reason); } catch (e) {}
 }
 
+function extractTokenFromCookieString(cookieStr){
+  try{
+    if(!cookieStr) return null;
+    // try same cookie names the netlify function looked for
+    const m = cookieStr.match(/(?:^|; )(?:sb-jwt-token|sb-access-token|umuy_token|access_token|token|umu_token)=([^;]+)/);
+    if(m) return decodeURIComponent(m[1]);
+  }catch(e){}
+  return null;
+}
+
+function tryAutoAuthFromReq(req){
+  try{
+    // 1) query param token
+    const url = req && req.url ? req.url : '';
+    try {
+      const idx = url.indexOf('?');
+      if(idx !== -1){
+        const qs = url.slice(idx+1);
+        const params = new URLSearchParams(qs);
+        const t = params.get('token');
+        if(t) return t;
+      }
+    } catch(e){}
+
+    // 2) cookie header
+    const cookieHeader = req && req.headers && (req.headers.cookie || req.headers.Cookie) ? (req.headers.cookie || req.headers.Cookie) : '';
+    const cToken = extractTokenFromCookieString(cookieHeader);
+    if(cToken) return cToken;
+
+    return null;
+  }catch(e){ return null; }
+}
+
 wss.on('connection', (ws, req) => {
   ws._meta = { authenticated: false, userId: null, createdAt: Date.now() };
-
   try {
     const origin = (req.headers && req.headers.origin) ? req.headers.origin : null;
     console.info('ws connection open - origin:', origin || '<none>');
-    // Only enforce allowed origins if env var is set
     if (ALLOWED_ORIGINS.length && origin && !ALLOWED_ORIGINS.includes(origin)) {
       console.warn('origin not allowed:', origin);
       closeWsWithReason(ws, 4003, 'origin_not_allowed');
@@ -177,11 +193,46 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.isAlive = true;
-  ws.on('pong', () => {
-    ws.isAlive = true;
-    // optional debug:
-    // console.info('pong from client', ws._meta && ws._meta.userId ? ws._meta.userId : '<anon>');
-  });
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  // Attempt auto-auth from token in query or cookie:
+  try {
+    const autoToken = tryAutoAuthFromReq(req);
+    if (autoToken) {
+      // small helper to register connection as authenticated
+      const register = async (token) => {
+        try {
+          let userId = token;
+          if (String(token).indexOf('.') > -1) {
+            try {
+              const parts = token.split('.');
+              const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+              userId = payload.sub || payload.user_id || payload.user || payload.id || userId;
+            } catch (e) { userId = token; }
+          }
+          ws._meta.authenticated = true;
+          ws._meta.userId = String(userId);
+          const set = userConnections.get(ws._meta.userId) || new Set();
+          set.add(ws);
+          userConnections.set(ws._meta.userId, set);
+          // set presence in-memory async
+          setPresence(ws._meta.userId, true).catch(()=>{});
+          // send auth_ok and presence_snapshot
+          sendWs(ws, { type: 'auth_ok', userId: ws._meta.userId });
+          const presence = await getPresence(ws._meta.userId);
+          sendWs(ws, { type: 'presence_snapshot', user: presence || { id: ws._meta.userId, online: true } });
+          console.info('auto-authenticated connection for user len token=', token ? String(token).length : 0, 'userId=', ws._meta.userId);
+        } catch (e) {
+          console.warn('auto-auth register error', String(e));
+        }
+      };
+      register(autoToken);
+    } else {
+      console.info('no auto-token found on ws connect; waiting for client auth message');
+    }
+  } catch (e) {
+    console.warn('auto-auth attempt error', String(e));
+  }
 
   ws.on('message', async (data) => {
     try {
@@ -192,54 +243,30 @@ wss.on('connection', (ws, req) => {
 
       if (obj.type === 'auth') {
         const token = (obj.token || '').toString();
-        console.info('auth request received (len token):', token ? token.length : 0);
+        console.info('auth message received len token=', token ? token.length : 0);
         if (!token) {
           sendWs(ws, { type: 'auth_failed', reason: 'no token' });
           ws.close(4001, 'no token');
           return;
         }
-        // try to extract user id from JWT-like token quickly (no verification)
         let userId = token;
         if (token.indexOf('.') > -1) {
           try {
             const parts = token.split('.');
             const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
             userId = payload.sub || payload.user_id || payload.user || payload.id || userId;
-          } catch (e) {
-            userId = token;
-          }
+          } catch (e) { userId = token; }
         }
         ws._meta.authenticated = true;
         ws._meta.userId = String(userId);
-
-        // register connection immediately
         const set = userConnections.get(ws._meta.userId) || new Set();
         set.add(ws);
         userConnections.set(ws._meta.userId, set);
-        console.info('user registered on WS:', ws._meta.userId, 'connections=', set.size);
-
-        // write presence in-memory and publish asynchronous (do not await)
-        try { setPresence(ws._meta.userId, true).catch ? setPresence(ws._meta.userId, true) : setPresence(ws._meta.userId, true); } catch (e) {}
-
-        // send auth_ok immediately (don't wait for redis)
+        // set presence (non-blocking)
+        try { setPresence(ws._meta.userId, true).catch(()=>{}); } catch (e) {}
         sendWs(ws, { type: 'auth_ok', userId: ws._meta.userId });
-
-        // send presence snapshot (prefer local fast copy; fallback to short redis query)
-        try {
-          const presenceLocal = lastSeenMap.get(String(ws._meta.userId));
-          if (presenceLocal) {
-            sendWs(ws, { type: 'presence_snapshot', user: presenceLocal });
-          } else {
-            (async () => {
-              const pres = await getPresence(ws._meta.userId);
-              sendWs(ws, { type: 'presence_snapshot', user: pres || { id: ws._meta.userId, online: true } });
-            })().catch(() => {
-              sendWs(ws, { type: 'presence_snapshot', user: { id: ws._meta.userId, online: true } });
-            });
-          }
-        } catch (e) {
-          sendWs(ws, { type: 'presence_snapshot', user: { id: ws._meta.userId, online: true } });
-        }
+        const presence = await getPresence(ws._meta.userId);
+        sendWs(ws, { type: 'presence_snapshot', user: presence || { id: ws._meta.userId, online: true } });
         return;
       }
 
@@ -249,7 +276,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // ping/pong handled elsewhere; handle supported message types
+      // handle the other message types (ping, typing, delivered, read, etc.)
       if (obj.type === 'ping') {
         sendWs(ws, { type: 'pong' });
         return;
@@ -316,8 +343,7 @@ wss.on('connection', (ws, req) => {
       }
 
       if (obj.type === 'location') {
-        const lat = obj.lat || null; const lon = obj.lon || null;
-        const acc = obj.accuracy || null; const ts = obj.timestamp || Date.now();
+        const lat = obj.lat || null; const lon = obj.lon || null; const acc = obj.accuracy || null; const ts = obj.timestamp || Date.now();
         const payload = { id: ws._meta.userId, location: { lat, lon, accuracy: acc, ts }, updated_at: Date.now() };
         const key = `presence:${ws._meta.userId}`;
         try {
