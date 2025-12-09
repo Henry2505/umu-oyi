@@ -65,10 +65,11 @@ async function setPresence(userId, online, extra) {
     if (extra && typeof extra === 'object') payload.meta = extra;
     lastSeenMap.set(String(userId), payload);
     if (USE_REDIS && redis) {
-      try { await redis.set(key, JSON.stringify(payload), 'EX', 60 * 60 * 24); } catch (e) {}
-      try { await redis.publish('umuy:realtime', JSON.stringify({ type: 'presence', user: payload, ts: now })); } catch (e) {}
+      try {
+        redis.set(key, JSON.stringify(payload), 'EX', 60 * 60 * 24).catch(() => {});
+        if (redisPub) redisPub.publish('umuy:realtime', JSON.stringify({ type: 'presence', user: payload, ts: now })).catch(() => {});
+      } catch (e) {}
     } else {
-      try { await Promise.resolve(); } catch (e) {}
       try { broadcastToAll({ type: 'presence', user: payload, ts: now }); } catch (e) {}
     }
   } catch (e) {}
@@ -76,10 +77,13 @@ async function setPresence(userId, online, extra) {
 async function getPresence(userId) {
   try {
     const key = `presence:${userId}`;
+    const local = lastSeenMap.get(String(userId));
+    if (local) return local;
     if (USE_REDIS && redis) {
       try {
-        const v = await redis.get(key);
-        if (v) return safeJsonParse(v);
+        const promise = redis.get(key);
+        const result = await Promise.race([promise, new Promise((r) => setTimeout(() => r(null), 500))]);
+        if (result) return safeJsonParse(result);
       } catch (e) {}
     }
     return lastSeenMap.get(String(userId)) || null;
@@ -98,7 +102,7 @@ app.post('/emit', async (req, res) => {
     if (!payload || !payload.type) return res.status(400).json({ error: 'Bad payload' });
     const envelope = { type: payload.type, message: payload.message || null, to: payload.to || null, meta: payload.meta || null, ts: Date.now() };
     if (USE_REDIS && redisPub) {
-      try { await redisPub.publish('umuy:realtime', JSON.stringify(envelope)); } catch (e) {}
+      try { redisPub.publish('umuy:realtime', JSON.stringify(envelope)).catch(() => {}); } catch (e) {}
     }
     if (envelope.to) broadcastToUser(envelope.to, envelope);
     else broadcastToAll(envelope);
@@ -150,10 +154,18 @@ wss.on('connection', (ws, req) => {
         const set = userConnections.get(ws._meta.userId) || new Set();
         set.add(ws);
         userConnections.set(ws._meta.userId, set);
-        try { await setPresence(ws._meta.userId, true); } catch (e) {}
+        try { setPresence(ws._meta.userId, true); } catch (e) {}
         sendWs(ws, { type: 'auth_ok', userId: ws._meta.userId });
-        const presence = await getPresence(ws._meta.userId);
-        sendWs(ws, { type: 'presence_snapshot', user: presence || { id: ws._meta.userId, online: true } });
+        try {
+          const presenceLocal = lastSeenMap.get(String(ws._meta.userId));
+          if (presenceLocal) sendWs(ws, { type: 'presence_snapshot', user: presenceLocal });
+          else {
+            const pres = await getPresence(ws._meta.userId);
+            sendWs(ws, { type: 'presence_snapshot', user: pres || { id: ws._meta.userId, online: true } });
+          }
+        } catch (e) {
+          sendWs(ws, { type: 'presence_snapshot', user: { id: ws._meta.userId, online: true } });
+        }
         return;
       }
       if (!ws._meta || !ws._meta.authenticated) {
@@ -169,7 +181,7 @@ wss.on('connection', (ws, req) => {
         const to = obj.to || null;
         const out = { type: 'typing', from: ws._meta.userId, to: to, typing: !!obj.typing, ts: Date.now() };
         if (USE_REDIS && redisPub) {
-          try { await redisPub.publish('umuy:realtime', JSON.stringify(out)); } catch (e) {}
+          try { redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(() => {}); } catch (e) {}
         }
         if (to) broadcastToUser(to, out);
         return;
@@ -178,7 +190,7 @@ wss.on('connection', (ws, req) => {
         const to = obj.to || null;
         const out = { type: 'message_delivered', id: obj.id || obj.messageId || null, from: ws._meta.userId, to: to, ts: Date.now() };
         if (USE_REDIS && redisPub) {
-          try { await redisPub.publish('umuy:realtime', JSON.stringify(out)); } catch (e) {}
+          try { redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(() => {}); } catch (e) {}
         }
         if (to) broadcastToUser(to, out);
         return;
@@ -187,7 +199,7 @@ wss.on('connection', (ws, req) => {
         const to = obj.to || null;
         const out = { type: 'message_read', id: obj.id || obj.messageId || null, from: ws._meta.userId, to: to, ts: Date.now() };
         if (USE_REDIS && redisPub) {
-          try { await redisPub.publish('umuy:realtime', JSON.stringify(out)); } catch (e) {}
+          try { redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(() => {}); } catch (e) {}
         }
         if (to) broadcastToUser(to, out);
         return;
@@ -196,7 +208,7 @@ wss.on('connection', (ws, req) => {
         const to = obj.to || null;
         const out = { type: 'message_played', id: obj.id || null, from: ws._meta.userId, to: to, ts: Date.now() };
         if (USE_REDIS && redisPub) {
-          try { await redisPub.publish('umuy:realtime', JSON.stringify(out)); } catch (e) {}
+          try { redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(() => {}); } catch (e) {}
         }
         if (to) broadcastToUser(to, out);
         return;
@@ -205,7 +217,7 @@ wss.on('connection', (ws, req) => {
         const to = obj.to || null;
         const out = { type: 'recording', from: ws._meta.userId, to: to, status: obj.status || 'start', ts: Date.now() };
         if (USE_REDIS && redisPub) {
-          try { await redisPub.publish('umuy:realtime', JSON.stringify(out)); } catch (e) {}
+          try { redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(() => {}); } catch (e) {}
         }
         if (to) broadcastToUser(to, out);
         return;
@@ -214,7 +226,7 @@ wss.on('connection', (ws, req) => {
         const to = obj.to || null;
         const out = { type: 'uploading', from: ws._meta.userId, to: to, status: obj.status || 'start', progress: obj.progress || 0, ts: Date.now() };
         if (USE_REDIS && redisPub) {
-          try { await redisPub.publish('umuy:realtime', JSON.stringify(out)); } catch (e) {}
+          try { redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(() => {}); } catch (e) {}
         }
         if (to) broadcastToUser(to, out);
         return;
@@ -227,11 +239,11 @@ wss.on('connection', (ws, req) => {
         const payload = { id: ws._meta.userId, location: { lat, lon, accuracy: acc, ts }, updated_at: Date.now() };
         const key = `presence:${ws._meta.userId}`;
         try {
+          lastSeenMap.set(String(ws._meta.userId), Object.assign({}, lastSeenMap.get(String(ws._meta.userId)) || {}, { id: ws._meta.userId, online: true, location: payload.location, updated_at: Date.now() }));
           if (USE_REDIS && redis) {
-            try { await redis.set(key, JSON.stringify(Object.assign({}, (await getPresence(ws._meta.userId)) || {}, { id: ws._meta.userId, online: true, location: payload.location, updated_at: Date.now() })), 'EX', 60 * 60 * 24); } catch (e) {}
-            try { await redis.publish('umuy:realtime', JSON.stringify({ type: 'location', user: payload, to: obj.to || null, ts: Date.now() })); } catch (e) {}
+            try { redis.set(key, JSON.stringify(Object.assign({}, lastSeenMap.get(String(ws._meta.userId)) || {}, { id: ws._meta.userId, online: true, location: payload.location, updated_at: Date.now() })), 'EX', 60 * 60 * 24).catch(() => {}); } catch (e) {}
+            if (redisPub) { try { redisPub.publish('umuy:realtime', JSON.stringify({ type: 'location', user: payload, to: obj.to || null, ts: Date.now() })).catch(() => {}); } catch (e) {} }
           } else {
-            lastSeenMap.set(String(ws._meta.userId), Object.assign({}, lastSeenMap.get(String(ws._meta.userId)) || {}, { id: ws._meta.userId, online: true, location: payload.location, updated_at: Date.now() }));
             try { broadcastToAll({ type: 'location', user: payload, to: obj.to || null, ts: Date.now() }); } catch (e) {}
           }
         } catch (e) {}
@@ -246,7 +258,7 @@ wss.on('connection', (ws, req) => {
         const to = obj.to || null;
         const out = { type: 'message_created', message: obj.payload, to: to, from: ws._meta.userId, ts: Date.now() };
         if (USE_REDIS && redisPub) {
-          try { await redisPub.publish('umuy:realtime', JSON.stringify(out)); } catch (e) {}
+          try { redisPub.publish('umuy:realtime', JSON.stringify(out)).catch(() => {}); } catch (e) {}
         }
         if (to) broadcastToUser(to, out);
         else broadcastToAll(out);
@@ -254,7 +266,7 @@ wss.on('connection', (ws, req) => {
       }
     } catch (e) {}
   });
-  ws.on('close', async () => {
+  ws.on('close', () => {
     try {
       const meta = ws._meta || {};
       if (meta && meta.userId) {
@@ -263,8 +275,7 @@ wss.on('connection', (ws, req) => {
           set.delete(ws);
           if (!set.size) {
             userConnections.delete(meta.userId);
-            await setPresence(meta.userId, false, { last_disconnect: Date.now() });
-            broadcastToAll({ type: 'presence', user: { id: meta.userId, online: false, last_seen: Date.now() }, ts: Date.now() });
+            try { setPresence(meta.userId, false, { last_disconnect: Date.now() }); } catch (e) {}
           }
         }
       }
