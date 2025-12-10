@@ -1,10 +1,11 @@
 {
   "name": "umuy-realtime-ws",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Tiny realtime websocket server (optional Redis pubsub)",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:dev": "nodemon index.js"
   },
   "dependencies": {
     "ws": "^8.13.0",
@@ -15,5 +16,6 @@
   },
   "engines": {
     "node": "18.x || 20.x"
-  }
+  },
+  "license": "MIT"
 }
