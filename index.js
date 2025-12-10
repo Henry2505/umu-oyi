@@ -7,6 +7,7 @@ const helmet = require('helmet');
 
 const REDIS_URL = process.env.REDIS_URL || '';
 const WEBSOCKET_SECRET = process.env.WEBSOCKET_SECRET || '';
+const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || '';
 const PORT = process.env.PORT || 3000;
 const REALTIME_WS_PATH = process.env.REALTIME_WS_PATH || '/realtime-ws';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -27,24 +28,60 @@ if (USE_REDIS) {
     console.info('Redis enabled for realtime presence/pubsub');
   } catch (err) {
     console.warn('Failed to init Redis, continuing without it:', String(err));
+    redis = null;
+    redisPub = null;
+    redisSub = null;
   }
 } else {
   console.info('Redis disabled (REDIS_URL not set)');
 }
 
+let jwt = null;
+if (SUPABASE_JWT_SECRET) {
+  try {
+    jwt = require('jsonwebtoken');
+  } catch (e) {
+    console.warn('jsonwebtoken not available; JWT verification disabled');
+    jwt = null;
+  }
+} else {
+  console.warn('SUPABASE_JWT_SECRET not set; JWT verification disabled (will try best-effort decode)');
+}
+
 const app = express();
 app.use(helmet());
-app.use(bodyParser.json({ limit: '2mb' }));
+app.use(bodyParser.json({ limit: '4mb' }));
 
-const userConnections = new Map(); // userId -> Set(ws)
-const lastSeenMap = new Map(); // userId -> presence payload
+const userConnections = new Map();
+const lastSeenMap = new Map();
 
 function safeJsonParse(s) {
   try { return JSON.parse(s); } catch (e) { return null; }
 }
 
+function maskToken(t) {
+  try {
+    if (!t) return '';
+    const s = String(t);
+    if (s.length <= 8) return '****';
+    return s.slice(0, 4) + '…' + s.slice(-4) + ` (len=${s.length})`;
+  } catch (e) { return '****'; }
+}
+
 function sendWs(ws, obj) {
-  try { ws.send(JSON.stringify(obj)); } catch (e) {}
+  try {
+    try {
+      const summary = { type: obj && obj.type ? obj.type : '<no-type>' };
+      if (obj && obj.userId) summary.userId = obj.userId;
+      if (obj && obj.user && obj.user.id) summary.user = obj.user.id;
+      if (obj && obj.reason) summary.reason = obj.reason;
+      if (obj && obj.token) summary.token = maskToken(obj.token);
+      console.info('send ->', summary);
+    } catch (e) {}
+    ws.send(JSON.stringify(obj));
+  } catch (e) {
+    try { ws.terminate(); } catch (err) {}
+  }
 }
 
 function broadcastToUser(userId, payload) {
@@ -74,7 +111,6 @@ function broadcastToAll(payload) {
   } catch (e) {}
 }
 
-// in-memory first, then fire-and-forget redis write/publish
 async function setPresence(userId, online, extra) {
   try {
     const key = `presence:${userId}`;
@@ -82,7 +118,6 @@ async function setPresence(userId, online, extra) {
     const payload = { id: String(userId), online: !!online, last_seen: online ? null : now, updated_at: now };
     if (extra && typeof extra === 'object') payload.meta = extra;
     lastSeenMap.set(String(userId), payload);
-
     if (USE_REDIS && redis) {
       try { redis.set(key, JSON.stringify(payload), 'EX', 60 * 60 * 24).catch(() => {}); } catch (e) {}
       try { if (redisPub) redisPub.publish('umuy:realtime', JSON.stringify({ type: 'presence', user: payload, ts: now })).catch(() => {}); } catch (e) {}
@@ -145,44 +180,82 @@ function closeWsWithReason(ws, code = 1008, reason = 'Policy') {
   try { ws.close(code, reason); } catch (e) {}
 }
 
-function extractTokenFromCookieString(cookieStr){
-  try{
-    if(!cookieStr) return null;
-    // try same cookie names the netlify function looked for
+function extractTokenFromCookieString(cookieStr) {
+  try {
+    if (!cookieStr) return null;
     const m = cookieStr.match(/(?:^|; )(?:sb-jwt-token|sb-access-token|umuy_token|access_token|token|umu_token)=([^;]+)/);
-    if(m) return decodeURIComponent(m[1]);
-  }catch(e){}
+    if (m) return decodeURIComponent(m[1]);
+  } catch (e) {}
   return null;
 }
 
-function tryAutoAuthFromReq(req){
-  try{
-    // 1) query param token
+function tryAutoAuthFromReq(req) {
+  try {
     const url = req && req.url ? req.url : '';
     try {
       const idx = url.indexOf('?');
-      if(idx !== -1){
-        const qs = url.slice(idx+1);
+      if (idx !== -1) {
+        const qs = url.slice(idx + 1);
         const params = new URLSearchParams(qs);
         const t = params.get('token');
-        if(t) return t;
+        if (t) {
+          console.info('auto-token found in query:', maskToken(t), 'req.url=', url);
+          return t;
+        }
       }
-    } catch(e){}
-
-    // 2) cookie header
+    } catch (e) {}
     const cookieHeader = req && req.headers && (req.headers.cookie || req.headers.Cookie) ? (req.headers.cookie || req.headers.Cookie) : '';
     const cToken = extractTokenFromCookieString(cookieHeader);
-    if(cToken) return cToken;
-
+    if (cToken) {
+      console.info('auto-token found in cookie header:', maskToken(cToken), 'cookieHeader=', cookieHeader ? '[present]' : '[none]');
+      return cToken;
+    }
+    console.info('no auto-token found on ws handshake; url=', url, 'origin=', req && req.headers && req.headers.origin ? req.headers.origin : '<none>');
     return null;
-  }catch(e){ return null; }
+  } catch (e) { return null; }
+}
+
+async function verifyAndExtractUserId(token) {
+  try {
+    if (!token) return null;
+    let userId = null;
+    if (jwt && SUPABASE_JWT_SECRET && token.indexOf('.') > -1) {
+      try {
+        const payload = jwt.verify(token, SUPABASE_JWT_SECRET);
+        userId = payload && (payload.sub || payload.user_id || payload.user || payload.id) ? String(payload.sub || payload.user_id || payload.user || payload.id) : null;
+        console.info('JWT verified via SUPABASE_JWT_SECRET mask=', maskToken(token));
+        return userId || token;
+      } catch (e) {
+        console.warn('JWT verify failed:', String(e), 'mask=', maskToken(token));
+        return null;
+      }
+    }
+    if (token.indexOf('.') > -1) {
+      try {
+        const parts = token.split('.');
+        const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+        userId = payload && (payload.sub || payload.user_id || payload.user || payload.id) ? String(payload.sub || payload.user_id || payload.user || payload.id) : null;
+        console.info('JWT decoded without verify mask=', maskToken(token));
+        return userId || token;
+      } catch (e) {
+        console.warn('JWT decode failed:', String(e));
+        return null;
+      }
+    }
+    return String(token);
+  } catch (e) {
+    return null;
+  }
 }
 
 wss.on('connection', (ws, req) => {
   ws._meta = { authenticated: false, userId: null, createdAt: Date.now() };
   try {
     const origin = (req.headers && req.headers.origin) ? req.headers.origin : null;
-    console.info('ws connection open - origin:', origin || '<none>');
+    console.info('ws connection open - remoteAddr:', (req.socket && (req.socket.remoteAddress || req.socket.remoteFamily)) || '<unknown>',
+      'url:', req.url || '<no-url>',
+      'origin:', origin || '<none>',
+      'cookie-present:', !!(req.headers && (req.headers.cookie || req.headers.Cookie)));
     if (ALLOWED_ORIGINS.length && origin && !ALLOWED_ORIGINS.includes(origin)) {
       console.warn('origin not allowed:', origin);
       closeWsWithReason(ws, 4003, 'origin_not_allowed');
@@ -195,38 +268,30 @@ wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  // Attempt auto-auth from token in query or cookie:
   try {
     const autoToken = tryAutoAuthFromReq(req);
     if (autoToken) {
-      // small helper to register connection as authenticated
-      const register = async (token) => {
+      (async (token) => {
         try {
-          let userId = token;
-          if (String(token).indexOf('.') > -1) {
-            try {
-              const parts = token.split('.');
-              const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
-              userId = payload.sub || payload.user_id || payload.user || payload.id || userId;
-            } catch (e) { userId = token; }
+          const userId = await verifyAndExtractUserId(token);
+          if (!userId) {
+            console.info('auto-token present but could not verify/extract user id mask=', maskToken(token));
+            return;
           }
           ws._meta.authenticated = true;
           ws._meta.userId = String(userId);
           const set = userConnections.get(ws._meta.userId) || new Set();
           set.add(ws);
           userConnections.set(ws._meta.userId, set);
-          // set presence in-memory async
-          setPresence(ws._meta.userId, true).catch(()=>{});
-          // send auth_ok and presence_snapshot
+          setPresence(ws._meta.userId, true).catch(() => {});
           sendWs(ws, { type: 'auth_ok', userId: ws._meta.userId });
           const presence = await getPresence(ws._meta.userId);
           sendWs(ws, { type: 'presence_snapshot', user: presence || { id: ws._meta.userId, online: true } });
-          console.info('auto-authenticated connection for user len token=', token ? String(token).length : 0, 'userId=', ws._meta.userId);
+          console.info('auto-authenticated connection for user mask=', maskToken(token), 'userId=', ws._meta.userId);
         } catch (e) {
           console.warn('auto-auth register error', String(e));
         }
-      };
-      register(autoToken);
+      })(autoToken);
     } else {
       console.info('no auto-token found on ws connect; waiting for client auth message');
     }
@@ -238,32 +303,40 @@ wss.on('connection', (ws, req) => {
     try {
       let msg = data;
       if (Buffer.isBuffer(msg)) msg = msg.toString();
+      const rawPreview = (typeof msg === 'string') ? (msg.length > 200 ? msg.slice(0, 200) + '… (truncated)' : msg) : '[non-string]';
+      console.debug('ws message received (raw preview):', rawPreview);
       const obj = safeJsonParse(msg);
+      if (!obj) {
+        console.debug('ws message: not JSON or failed parse');
+        return;
+      }
+      if (obj.type === 'auth') {
+        const token = (obj.token || '').toString();
+        console.info('auth message received token=', maskToken(token));
+      } else {
+        console.info('ws message parsed:', { type: obj.type || '<none>', keys: Object.keys(obj).slice(0, 10) });
+      }
       if (!obj || !obj.type) return;
 
       if (obj.type === 'auth') {
         const token = (obj.token || '').toString();
-        console.info('auth message received len token=', token ? token.length : 0);
         if (!token) {
           sendWs(ws, { type: 'auth_failed', reason: 'no token' });
-          ws.close(4001, 'no token');
+          try { ws.close(4001, 'no token'); } catch (e) {}
           return;
         }
-        let userId = token;
-        if (token.indexOf('.') > -1) {
-          try {
-            const parts = token.split('.');
-            const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
-            userId = payload.sub || payload.user_id || payload.user || payload.id || userId;
-          } catch (e) { userId = token; }
+        const userId = await verifyAndExtractUserId(token);
+        if (!userId) {
+          sendWs(ws, { type: 'auth_failed', reason: 'invalid_token' });
+          try { ws.close(4002, 'invalid_token'); } catch (e) {}
+          return;
         }
         ws._meta.authenticated = true;
         ws._meta.userId = String(userId);
         const set = userConnections.get(ws._meta.userId) || new Set();
         set.add(ws);
         userConnections.set(ws._meta.userId, set);
-        // set presence (non-blocking)
-        try { setPresence(ws._meta.userId, true).catch(()=>{}); } catch (e) {}
+        try { setPresence(ws._meta.userId, true).catch(() => {}); } catch (e) {}
         sendWs(ws, { type: 'auth_ok', userId: ws._meta.userId });
         const presence = await getPresence(ws._meta.userId);
         sendWs(ws, { type: 'presence_snapshot', user: presence || { id: ws._meta.userId, online: true } });
@@ -272,11 +345,10 @@ wss.on('connection', (ws, req) => {
 
       if (!ws._meta || !ws._meta.authenticated) {
         sendWs(ws, { type: 'error', reason: 'not_authenticated' });
-        ws.close(4003, 'not_authenticated');
+        try { ws.close(4003, 'not_authenticated'); } catch (e) {}
         return;
       }
 
-      // handle the other message types (ping, typing, delivered, read, etc.)
       if (obj.type === 'ping') {
         sendWs(ws, { type: 'pong' });
         return;
@@ -445,4 +517,5 @@ server.listen(PORT, () => {
   console.log(`Realtime WS server listening on port ${PORT} path ${REALTIME_WS_PATH}`);
   if (APP_URL) console.log('App URL:', APP_URL);
   if (!WEBSOCKET_SECRET) console.warn('WEBSOCKET_SECRET not set');
+  if (!SUPABASE_JWT_SECRET) console.warn('SUPABASE_JWT_SECRET not set; JWT verification disabled');
 });
