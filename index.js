@@ -9,7 +9,7 @@ const REDIS_URL = process.env.REDIS_URL || '';
 const WEBSOCKET_SECRET = process.env.WEBSOCKET_SECRET || '';
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || '';
 const PORT = process.env.PORT || 3000;
-const REALTIME_WS_PATH = process.env.REALTIME_WS_PATH || '/realtime-ws';
+const REALTIME_WS_PATH = (process.env.REALTIME_WS_PATH || '/realtime-ws').replace(/\/+$/, '') || '/realtime-ws';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const APP_URL = (process.env.APP_URL || '').replace(/\/$/, '') || '';
 
@@ -78,7 +78,7 @@ function sendWs(ws, obj) {
       if (obj && obj.token) summary.token = maskToken(obj.token);
       console.info('send ->', summary);
     } catch (e) {}
-    ws.send(JSON.stringify(obj));
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   } catch (e) {
     try { ws.terminate(); } catch (err) {}
   }
@@ -98,15 +98,23 @@ function broadcastToUser(userId, payload) {
         }
       } catch (e) {}
     }
+    if (set.size === 0) userConnections.delete(String(userId));
   } catch (e) {}
 }
 
 function broadcastToAll(payload) {
   try {
     for (const [uid, set] of userConnections.entries()) {
-      for (const c of set) {
-        try { if (c.readyState === WebSocket.OPEN) sendWs(c, payload); } catch (e) {}
+      for (const c of Array.from(set)) {
+        try {
+          if (c.readyState === WebSocket.OPEN) sendWs(c, payload);
+          else {
+            try { c.terminate(); } catch (e) {}
+            set.delete(c);
+          }
+        } catch (e) {}
       }
+      if (set.size === 0) userConnections.delete(uid);
     }
   } catch (e) {}
 }
@@ -172,12 +180,30 @@ app.post('/emit', async (req, res) => {
   }
 });
 
+app.get(REALTIME_WS_PATH, (req, res) => {
+  res.json({ ok: true, ws_path: REALTIME_WS_PATH, clients: wss ? wss.clients.size : 0 });
+});
+
+function requireSecret(req, res, next) {
+  const provided = (req.headers['x-realtime-secret'] || req.query.secret || '').toString();
+  if (WEBSOCKET_SECRET && provided === WEBSOCKET_SECRET) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
+app.get('/connections', requireSecret, (req, res) => {
+  const out = [];
+  for (const [uid, set] of userConnections.entries()) {
+    out.push({ userId: uid, connections: set.size });
+  }
+  res.json({ ok: true, count: out.length, list: out });
+});
+
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: REALTIME_WS_PATH });
+const wss = new WebSocket.Server({ server });
 
 function closeWsWithReason(ws, code = 1008, reason = 'Policy') {
-  try { ws.send(JSON.stringify({ type: 'error', reason })); } catch (e) {}
-  try { ws.close(code, reason); } catch (e) {}
+  try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', reason })); } catch (e) {}
+  try { if (ws) ws.close(code, reason); } catch (e) {}
 }
 
 function extractTokenFromCookieString(cookieStr) {
@@ -252,6 +278,7 @@ wss.on('connection', (ws, req) => {
   ws._meta = { authenticated: false, userId: null, createdAt: Date.now() };
   try {
     const origin = (req.headers && req.headers.origin) ? req.headers.origin : null;
+    const requestUrl = (req && req.url) ? req.url.split('?')[0] : '/';
     console.info('ws connection open - remoteAddr:', (req.socket && (req.socket.remoteAddress || req.socket.remoteFamily)) || '<unknown>',
       'url:', req.url || '<no-url>',
       'origin:', origin || '<none>',
@@ -260,6 +287,9 @@ wss.on('connection', (ws, req) => {
       console.warn('origin not allowed:', origin);
       closeWsWithReason(ws, 4003, 'origin_not_allowed');
       return;
+    }
+    if (!(requestUrl === REALTIME_WS_PATH || requestUrl === '/' || requestUrl === '/')) {
+      console.info('ws connected to unexpected path:', requestUrl, 'allowed path:', REALTIME_WS_PATH);
     }
   } catch (e) {
     console.warn('origin check error', String(e));
@@ -506,12 +536,23 @@ if (USE_REDIS && redisSub) {
 setInterval(() => {
   wss.clients.forEach((client) => {
     try {
-      if (!client.isAlive) return client.terminate();
+      if (!client.isAlive) {
+        try { client.terminate(); } catch (e) {}
+        return;
+      }
       client.isAlive = false;
-      client.ping(() => {});
+      try { client.ping(() => {}); } catch (e) {}
     } catch (e) {}
   });
 }, 30000);
+
+process.on('uncaughtException', (err) => {
+  try { console.error('uncaughtException', String(err)); } catch (e) {}
+});
+
+process.on('unhandledRejection', (reason) => {
+  try { console.error('unhandledRejection', String(reason)); } catch (e) {}
+});
 
 server.listen(PORT, () => {
   console.log(`Realtime WS server listening on port ${PORT} path ${REALTIME_WS_PATH}`);
