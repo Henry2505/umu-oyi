@@ -4,7 +4,13 @@ const http = require('http');
 const WebSocket = require('ws');
 const bodyParser = require('body-parser');
 const helmet = require('helmet');
-const webpush = require('web-push');
+
+let webpush = null;
+try {
+  webpush = require('web-push');
+} catch (e) {
+  console.warn('web-push module not available; push notifications disabled.');
+}
 
 const REDIS_URL = process.env.REDIS_URL || '';
 const WEBSOCKET_SECRET = process.env.WEBSOCKET_SECRET || '';
@@ -217,26 +223,38 @@ async function getSubscriptions(userId) {
 
 let VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || '';
 let VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
-if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
-  try {
-    const keys = webpush.generateVAPIDKeys();
-    VAPID_PUBLIC = keys.publicKey;
-    VAPID_PRIVATE = keys.privateKey;
-    if (USE_REDIS && redis) {
-      try { redis.hset('push:vapid', 'public', VAPID_PUBLIC, 'private', VAPID_PRIVATE).catch(() => {}); } catch (e) {}
+if (webpush) {
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
+    try {
+      const keys = webpush.generateVAPIDKeys();
+      VAPID_PUBLIC = keys.publicKey;
+      VAPID_PRIVATE = keys.privateKey;
+      if (USE_REDIS && redis) {
+        try { redis.hset('push:vapid', 'public', VAPID_PUBLIC, 'private', VAPID_PRIVATE).catch(() => {}); } catch (e) {}
+      }
+      console.info('Generated VAPID keys. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY in env to persist.');
+      console.info('VAPID_PUBLIC_KEY=' + VAPID_PUBLIC);
+      console.info('VAPID_PRIVATE_KEY=' + VAPID_PRIVATE);
+    } catch (e) {
+      console.warn('vapid generate failed', String(e));
     }
-    console.info('Generated VAPID keys. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY in env to persist.');
-    console.info('VAPID_PUBLIC_KEY=' + VAPID_PUBLIC);
-    console.info('VAPID_PRIVATE_KEY=' + VAPID_PRIVATE);
-  } catch (e) {
-    console.warn('vapid generate failed', String(e));
   }
+  const VAPID_SUBJECT = process.env.VAPID_SUBJECT || APP_URL || 'mailto:admin@umugwuanyi-oyi.name.ng';
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
+  } catch (e) {
+    console.warn('webpush.setVapidDetails failed', String(e));
+  }
+} else {
+  console.info('Push notifications disabled because web-push module is not present.');
 }
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || APP_URL || 'mailto:admin@umugwuanyi-oyi.name.ng';
-webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
 
 async function sendPushToUser(userId, payload) {
   try {
+    if (!webpush) {
+      // Push not available — no-op
+      return;
+    }
     const subs = await getSubscriptions(userId);
     if (!subs || !subs.length) return;
     for (const sub of subs) {
@@ -261,11 +279,13 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/vapidPublicKey', (req, res) => {
+  // return the public key if web-push enabled; otherwise empty string
   res.json({ publicKey: VAPID_PUBLIC || '' });
 });
 
 app.post('/push/subscribe', async (req, res) => {
   try {
+    if (!webpush) return res.status(501).json({ error: 'Push not supported on this server' });
     const body = req.body || {};
     const userId = body.userId || body.userid || (body.subscription && body.subscription.userId) || null;
     const subscription = body.subscription || null;
@@ -280,6 +300,7 @@ app.post('/push/subscribe', async (req, res) => {
 
 app.post('/push/unsubscribe', async (req, res) => {
   try {
+    if (!webpush) return res.status(501).json({ error: 'Push not supported on this server' });
     const body = req.body || {};
     const userId = body.userId || body.userid || null;
     const endpoint = body.endpoint || (body.subscription && body.subscription.endpoint) || null;
@@ -308,7 +329,8 @@ app.post('/emit', async (req, res) => {
     else broadcastToAll(envelope);
     if (envelope.type === 'call_invite' && envelope.to) {
       const pushPayload = { title: envelope.meta && envelope.meta.displayName ? envelope.meta.displayName + ' is calling' : 'Incoming call', body: envelope.meta && envelope.meta.call_type ? envelope.meta.call_type + ' call' : 'Incoming call', data: { type: 'call_invite', callId: envelope.message && envelope.message.callId ? envelope.message.callId : envelope.meta && envelope.meta.callId ? envelope.meta.callId : envelope.ts, from: envelope.meta && envelope.meta.displayName ? envelope.meta.displayName : envelope.to }, ts: Date.now() };
-      sendPushToUser(envelope.to, pushPayload);
+      // only attempt to send push if webpush is available
+      if (webpush) sendPushToUser(envelope.to, pushPayload);
     }
     return res.json({ ok: true });
   } catch (err) {
