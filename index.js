@@ -4,6 +4,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const bodyParser = require('body-parser');
 const helmet = require('helmet');
+const webpush = require('web-push');
 
 const REDIS_URL = process.env.REDIS_URL || '';
 const WEBSOCKET_SECRET = process.env.WEBSOCKET_SECRET || '';
@@ -11,7 +12,7 @@ const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET || '';
 const PORT = process.env.PORT || 3000;
 const REALTIME_WS_PATH = (process.env.REALTIME_WS_PATH || '/realtime-ws').replace(/\/+$/, '') || '/realtime-ws';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-const APP_URL = (process.env.APP_URL || '').replace(/\/$/, '') || '';
+const APP_URL = (process.env.APP_URL || '').replace(/\/$/, '') || 'https://umugwuanyi-oyi.name.ng';
 
 let redis = null;
 let redisPub = null;
@@ -156,8 +157,139 @@ async function getPresence(userId) {
   } catch (e) { return null; }
 }
 
+const pushSubsMap = new Map();
+
+async function saveSubscription(userId, subscription) {
+  try {
+    if (!userId || !subscription || !subscription.endpoint) return false;
+    if (USE_REDIS && redis) {
+      const key = `push:subs:${userId}`;
+      await redis.hset(key, subscription.endpoint, JSON.stringify(subscription));
+      await redis.expire(key, 60 * 60 * 24 * 30);
+      return true;
+    } else {
+      const arr = pushSubsMap.get(String(userId)) || {};
+      arr[subscription.endpoint] = subscription;
+      pushSubsMap.set(String(userId), arr);
+      return true;
+    }
+  } catch (e) {
+    return false;
+  }
+}
+
+async function removeSubscription(userId, endpoint) {
+  try {
+    if (!userId || !endpoint) return false;
+    if (USE_REDIS && redis) {
+      const key = `push:subs:${userId}`;
+      await redis.hdel(key, endpoint);
+      return true;
+    } else {
+      const arr = pushSubsMap.get(String(userId)) || {};
+      if (arr[endpoint]) delete arr[endpoint];
+      pushSubsMap.set(String(userId), arr);
+      return true;
+    }
+  } catch (e) {
+    return false;
+  }
+}
+
+async function getSubscriptions(userId) {
+  try {
+    if (!userId) return [];
+    if (USE_REDIS && redis) {
+      const key = `push:subs:${userId}`;
+      const map = await redis.hgetall(key);
+      if (!map) return [];
+      return Object.keys(map).map(k => {
+        try { return JSON.parse(map[k]); } catch (e) { return null; }
+      }).filter(Boolean);
+    } else {
+      const map = pushSubsMap.get(String(userId)) || {};
+      return Object.keys(map).map(k => map[k]);
+    }
+  } catch (e) {
+    return [];
+  }
+}
+
+let VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || '';
+let VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
+if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
+  try {
+    const keys = webpush.generateVAPIDKeys();
+    VAPID_PUBLIC = keys.publicKey;
+    VAPID_PRIVATE = keys.privateKey;
+    if (USE_REDIS && redis) {
+      try { redis.hset('push:vapid', 'public', VAPID_PUBLIC, 'private', VAPID_PRIVATE).catch(() => {}); } catch (e) {}
+    }
+    console.info('Generated VAPID keys. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY in env to persist.');
+    console.info('VAPID_PUBLIC_KEY=' + VAPID_PUBLIC);
+    console.info('VAPID_PRIVATE_KEY=' + VAPID_PRIVATE);
+  } catch (e) {
+    console.warn('vapid generate failed', String(e));
+  }
+}
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || APP_URL || 'mailto:admin@umugwuanyi-oyi.name.ng';
+webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
+
+async function sendPushToUser(userId, payload) {
+  try {
+    const subs = await getSubscriptions(userId);
+    if (!subs || !subs.length) return;
+    for (const sub of subs) {
+      try {
+        await webpush.sendNotification(sub, JSON.stringify(payload));
+      } catch (err) {
+        const status = err && err.statusCode ? err.statusCode : null;
+        if (status === 410 || status === 404) {
+          try { await removeSubscription(userId, sub.endpoint); } catch (e) {}
+        } else {
+          try { console.warn('webpush send error', String(err)); } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {
+    try { console.warn('sendPushToUser error', String(e)); } catch (err) {}
+  }
+}
+
 app.get('/health', (req, res) => {
   res.json({ ok: true, pid: process.pid, ws_path: REALTIME_WS_PATH });
+});
+
+app.get('/vapidPublicKey', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC || '' });
+});
+
+app.post('/push/subscribe', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const userId = body.userId || body.userid || (body.subscription && body.subscription.userId) || null;
+    const subscription = body.subscription || null;
+    if (!userId || !subscription) return res.status(400).json({ error: 'userId and subscription required' });
+    const ok = await saveSubscription(String(userId), subscription);
+    if (!ok) return res.status(500).json({ error: 'failed' });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post('/push/unsubscribe', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const userId = body.userId || body.userid || null;
+    const endpoint = body.endpoint || (body.subscription && body.subscription.endpoint) || null;
+    if (!userId || !endpoint) return res.status(400).json({ error: 'userId and endpoint required' });
+    const ok = await removeSubscription(String(userId), endpoint);
+    if (!ok) return res.status(500).json({ error: 'failed' });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
 });
 
 app.post('/emit', async (req, res) => {
@@ -174,6 +306,10 @@ app.post('/emit', async (req, res) => {
     }
     if (envelope.to) broadcastToUser(envelope.to, envelope);
     else broadcastToAll(envelope);
+    if (envelope.type === 'call_invite' && envelope.to) {
+      const pushPayload = { title: envelope.meta && envelope.meta.displayName ? envelope.meta.displayName + ' is calling' : 'Incoming call', body: envelope.meta && envelope.meta.call_type ? envelope.meta.call_type + ' call' : 'Incoming call', data: { type: 'call_invite', callId: envelope.message && envelope.message.callId ? envelope.message.callId : envelope.meta && envelope.meta.callId ? envelope.meta.callId : envelope.ts, from: envelope.meta && envelope.meta.displayName ? envelope.meta.displayName : envelope.to }, ts: Date.now() };
+      sendPushToUser(envelope.to, pushPayload);
+    }
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
